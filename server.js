@@ -7,7 +7,6 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
 import multer from "multer";
-import crypto from "crypto";
 
 // ==========================================
 // 1. SYSTEM SETUP & DATABASE
@@ -19,45 +18,32 @@ const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 app.use(cors());
 app.use(express.json());
 
+// Initialize PostgreSQL Pool
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.PGSSL === "true" ? { rejectUnauthorized: false } : false,
 });
 
 // ==========================================
-// 2. MOCKED SERVICES (Skipping Redis setup for local testing)
-// ==========================================
-const queueSlaReminder = async (ticketId, slaDeadlineAt) => {
-  logger.info(`[MOCK QUEUE] SLA Reminder set for Ticket ${ticketId} at ${slaDeadlineAt}`);
-};
-const queueNotification = async (eventType, payload) => {
-  logger.info(`[MOCK QUEUE] Notification queued: ${eventType}`, payload);
-};
-const notifyTicketUpdated = async (payload) => {
-  logger.info(`[MOCK NOTIFY] Ticket updated:`, payload);
-};
-const scanUploadedFileOrThrow = async (_filePath) => {
-  return true; // Mocked virus scan
-};
-
-// ==========================================
-// 3. MIDDLEWARE
+// 2. MIDDLEWARE
 // ==========================================
 const authenticate = (req, res, next) => {
   const authHeader = req.headers.authorization || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  if (!token) return res.status(401).json({ message: "Missing bearer token." });
+  
+  if (!token) return res.status(401).json({ message: "Access denied. Missing bearer token." });
+  
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
     return next();
   } catch {
-    return res.status(401).json({ message: "Invalid or expired token." });
+    return res.status(401).json({ message: "Invalid or expired session. Please log in again." });
   }
 };
 
 const authorizeRoles = (...roles) => (req, res, next) => {
   if (!req.user?.role) return res.status(403).json({ message: "Role not available." });
-  if (!roles.includes(req.user.role)) return res.status(403).json({ message: "Forbidden for current role." });
+  if (!roles.includes(req.user.role)) return res.status(403).json({ message: "Forbidden. Higher clearance required." });
   return next();
 };
 
@@ -67,7 +53,7 @@ const errorHandler = (err, req, res, next) => {
 };
 
 // ==========================================
-// 4. API ROUTES
+// 3. API ROUTES
 // ==========================================
 
 // --- HEALTH CHECK ---
@@ -75,7 +61,7 @@ app.get("/api/v1/health", async (req, res, next) => {
   try {
     const start = Date.now();
     await pool.query("SELECT 1");
-    res.json({ status: "ok", uptime: process.uptime(), dbLatencyMs: Date.now() - start, timestamp: new Date().toISOString() });
+    res.json({ status: "ok", uptime: process.uptime(), dbLatencyMs: Date.now() - start });
   } catch (error) {
     next(error);
   }
@@ -83,103 +69,108 @@ app.get("/api/v1/health", async (req, res, next) => {
 
 // --- AUTHENTICATION ---
 const loginSchema = z.object({ email: z.string().email(), password: z.string().min(6) });
+
 app.post("/api/v1/auth/login", async (req, res, next) => {
   try {
     const { email, password } = loginSchema.parse(req.body);
     const { rows } = await pool.query(`SELECT id, full_name, email, password_hash, role, is_active FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1`, [email]);
+    
     if (!rows.length) throw new Error("Invalid credentials.");
     const user = rows[0];
-    if (!user.is_active) throw new Error("User is inactive.");
+    if (!user.is_active) throw new Error("User account is locked or inactive.");
     
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) throw new Error("Invalid credentials.");
 
-    const token = jwt.sign({ id: user.id, role: user.role, email: user.email, name: user.full_name }, process.env.JWT_SECRET, { expiresIn: "12h" });
+    const token = jwt.sign({ id: user.id, role: user.role, email: user.email, name: user.full_name }, process.env.JWT_SECRET, { expiresIn: "24h" });
     res.json({ token, user: { id: user.id, name: user.full_name, email: user.email, role: user.role } });
   } catch (error) {
-    if (error.name === "ZodError") return res.status(400).json({ message: "Invalid login payload." });
-    if (error.message === "Invalid credentials." || error.message === "User is inactive.") return res.status(401).json({ message: error.message });
+    if (error.name === "ZodError") return res.status(400).json({ message: "Invalid email or password format." });
+    if (error.message === "Invalid credentials." || error.message.includes("inactive")) return res.status(401).json({ message: error.message });
     next(error);
   }
 });
 
-// --- ANALYTICS ---
-// Note: We removed the 'authenticate' middleware here temporarily so your frontend can test saving without a login screen!
-app.post("/api/v1/analytics/events", async (req, res, next) => {
+// --- PRICING ENGINE ---
+
+// GET: Fetch live pricing for the dashboard
+app.get("/api/v1/pricing", authenticate, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT name AS service, base_cost AS "baseCost", margin_percentage AS margin FROM services ORDER BY id ASC'
+    );
+    res.json({ data: rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// PUT: Bulk update pricing (Wrapped in a SQL Transaction)
+app.put("/api/v1/pricing", authenticate, authorizeRoles("ADMIN", "SUPER_ADMIN"), async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    const { rows } = req.body;
+    if (!Array.isArray(rows) || rows.length === 0) return res.status(400).json({ message: "No pricing data provided." });
+
+    logger.info(`[PRICING] ${req.user.name} updating ${rows.length} services.`);
+    
+    await client.query('BEGIN'); // Start transaction
+    
+    for (let row of rows) {
+      await client.query(
+        'UPDATE services SET base_cost = $1, margin_percentage = $2 WHERE name = $3',
+        [row.baseCost, row.margin, row.service]
+      );
+    }
+    
+    await client.query('COMMIT'); // Lock in the changes
+    res.status(200).json({ message: "Pricing updated successfully." });
+  } catch (error) {
+    await client.query('ROLLBACK'); // Cancel everything if one fails
+    next(error);
+  } finally {
+    client.release();
+  }
+});
+
+// --- STAFF ROSTER ---
+app.get("/api/v1/staff", authenticate, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, full_name AS name, role, current_site AS site, status FROM staff ORDER BY full_name ASC'
+    );
+    res.json({ data: rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- CLIENTS & INVOICING ---
+app.get("/api/v1/clients", authenticate, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, company_name AS name, contract_end_date AS "contractEnd", monthly_value AS "totalMonthly" FROM clients ORDER BY company_name ASC'
+    );
+    res.json({ data: rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// --- SYSTEM ANALYTICS ---
+app.post("/api/v1/analytics/events", authenticate, async (req, res, next) => {
   try {
     const schema = z.object({ eventType: z.string().min(3), metadata: z.record(z.any()).optional() });
     const { eventType, metadata } = schema.parse(req.body);
-    // Real DB track event mocked for local testing without DB setup yet
-    logger.info(`[ANALYTICS] Event Tracked: ${eventType}`, metadata);
+    
+    await pool.query(
+      'INSERT INTO analytics_events (user_id, event_type, metadata) VALUES ($1, $2, $3)',
+      [req.user.id, eventType, JSON.stringify(metadata || {})]
+    );
+    
     res.status(201).json({ message: "Event tracked." });
   } catch (error) {
-    if (error.name === "ZodError") return res.status(400).json({ message: "Invalid analytics event payload." });
-    next(error);
-  }
-});
-
-// --- PRICING & SERVICES ---
-// Note: Removed 'authenticate' middleware temporarily for frontend testing
-app.put("/api/v1/pricing/services", async (req, res, next) => {
-  try {
-    const { rows } = req.body;
-    logger.info(`[PRICING] Received Bulk Pricing Update for ${rows.length} services.`);
-    
-    // In production, this would loop through rows and do:
-    // await pool.query('UPDATE services SET base_cost = $1, margin_percentage = $2 WHERE name = $3', [...])
-    
-    res.status(200).json({ message: "Pricing updated successfully.", data: rows });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/v1/pricing/services/:serviceName/final-price", authenticate, authorizeRoles("ADMIN", "CLIENT", "STAFF"), async (req, res, next) => {
-  try {
-    // Mocked DB lookup
-    const data = { serviceName: req.params.serviceName, finalPrice: 9999 }; 
-    const etag = crypto.createHash("sha1").update(JSON.stringify(data)).digest("hex");
-    if (req.headers["if-none-match"] === etag) return res.status(304).end();
-    res.setHeader("ETag", etag);
-    res.setHeader("Cache-Control", "private, max-age=60");
-    res.json({ data });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// --- TICKETS (WITH UPLOADS) ---
-const upload = multer({
-  dest: "uploads/",
-  limits: { fileSize: 8 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    const allowed = ["image/jpeg", "image/png", "image/webp", "video/mp4", "video/webm"];
-    if (!allowed.includes(file.mimetype)) return cb(new Error("Unsupported file type."));
-    cb(null, true);
-  },
-});
-
-app.post("/api/v1/tickets", authenticate, authorizeRoles("CLIENT"), upload.single("attachment"), async (req, res, next) => {
-  try {
-    const schema = z.object({
-      bookingId: z.coerce.number().optional(),
-      relatedServiceId: z.coerce.number().optional(),
-      subject: z.string().min(3),
-      description: z.string().min(10),
-      priority: z.enum(["LOW", "MEDIUM", "HIGH", "CRITICAL"]),
-    });
-    const payload = schema.parse(req.body);
-    if (req.file?.path) await scanUploadedFileOrThrow(req.file.path);
-    
-    // Mocked DB Insertion
-    const ticket = { id: Math.floor(Math.random() * 1000), ...payload, client_id: req.user.id, status: "OPEN" };
-    
-    await queueSlaReminder(ticket.id, new Date().toISOString());
-    await queueNotification("TICKET_CREATED", { ticketId: ticket.id, clientId: ticket.client_id });
-    
-    res.status(201).json({ message: "Ticket created", data: ticket });
-  } catch (error) {
-    if (error.name === "ZodError") return res.status(400).json({ message: "Invalid ticket payload." });
+    if (error.name === "ZodError") return res.status(400).json({ message: "Invalid payload." });
     next(error);
   }
 });
@@ -187,8 +178,8 @@ app.post("/api/v1/tickets", authenticate, authorizeRoles("CLIENT"), upload.singl
 app.use(errorHandler);
 
 // ==========================================
-// 5. START SERVER
+// 4. START SERVER
 // ==========================================
 app.listen(PORT, () => {
-  logger.info(`Zenith ERP Backend running smoothly on http://localhost:${PORT}`);
+  logger.info(`Zenith ERP Backend running smoothly on port ${PORT}`);
 });
